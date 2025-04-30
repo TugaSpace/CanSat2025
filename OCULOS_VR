@@ -66,7 +66,7 @@ float lat_local = 36.96792019268669;
 float lon_local = -25.156691449099657;
 float alt_local = 100.0;
 float lat_cansat = 0.0, lon_cansat = 0.0, alt_cansat = 0.0;
-
+float distancia;
 // Variáveis de Orientação e Erros
 float yawSensor = 0.0, pitchSensor = 0.0;
 float offsetYaw = 0.0;
@@ -82,8 +82,7 @@ const float maxErroInclinacao = 30.0;
 const float erroMiraPerfeito = 5.0;
 int16_t centroX = 240;
 int16_t centroY = 160;
-//Dados aceleração
-float alt_GPS,AccX,AccY, AccZ;
+
 
 // Simulação
 bool modoSimulacao = true;
