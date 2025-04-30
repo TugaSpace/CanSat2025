@@ -1,0 +1,52 @@
+{
+	"folders": [
+		{
+			"path": "../../../../../../../Tuga/Teste"
+		},
+		{
+			"name": "Modulo Sensores",
+			"path": "../../Modulo Sensores"
+		},
+		{
+			"name": "testeicm",
+			"path": "../../testeicm"
+		},
+		{
+			"name": "Lipo",
+			"path": "../../Lipo"
+		},
+		{
+			"name": "EspNow",
+			"path": "../../EspNow"
+		},
+		{
+			"name": "GPS",
+			"path": "../../GPS"
+		},
+		{
+			"name": "Em partes",
+			"path": ".."
+		},
+		{
+			"name": "Direct acess",
+			"path": "../../Direct acess"
+		},
+		{
+			"name": "datalogger",
+			"path": "../../datalogger"
+		},
+		{
+			"name": "max",
+			"path": "../../max"
+		},
+		{
+			"name": "Modulo_Principal",
+			"path": "../../Modulo_Principal"
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"*.tcc": "cpp"
+		}
+	}
+}
