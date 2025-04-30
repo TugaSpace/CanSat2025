@@ -1,0 +1,379 @@
+// Projeto Óculos VR2 - Localizar CanSat
+
+#include <Wire.h>
+#include <Adafruit_BMP3XX.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+#include <TinyGPS++.h>
+#include <SPI.h>
+#include <RF24.h>
+#include <RF24Network.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7796S.h>
+#include <Fonts/FreeSansBold18pt7b.h>
+#include <math.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+// Pinos
+#define PIN_CE D10
+#define PIN_CSN D9
+#define PIN_GPS_RX A1
+#define PIN_GPS_TX A0
+#define PIN_BUZZER D8
+#define PIN_BOTAO A2
+#define PIN_SCK D2
+#define PIN_MISO D3
+#define PIN_MOSI D4
+#define PIN_CS D6
+#define PIN_DC D5
+#define PIN_RST -1
+#define PIN_DATALOGGER_RX A6
+#define PIN_DATALOGGER_TX A7
+
+// Hardware
+Adafruit_BMP3XX bmp;
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x29);
+TinyGPSPlus gps;
+SPIClass hspi(HSPI);
+Adafruit_ST7796S display(&hspi, PIN_CS, PIN_DC, PIN_RST);
+RF24 radio(PIN_CE, PIN_CSN);
+RF24Network network(radio);
+HardwareSerial SerialGPS(1);
+HardwareSerial SerialLogger(2);
+
+// Estrutura de Dados
+typedef struct {
+  uint32_t NumeroPacote;
+  uint32_t timestamp;
+  bool ativo1, ativo2, ativo3;
+  float temperature;
+  float pressure;
+  float altitude;
+  float AccX, AccY, AccZ;
+  float GyroX, GyroY, GyroZ;
+  float MagX, MagY, MagZ;
+  float latitude;
+  float longitude;
+  float altitudeGPS;
+} __attribute__((packed)) TMVData_t;
+
+TMVData_t dadosRecebidos;
+
+// Variáveis de Posição
+float lat_local = 36.96792019268669;
+float lon_local = -25.156691449099657;
+float alt_local = 100.0;
+float lat_cansat = 0.0, lon_cansat = 0.0, alt_cansat = 0.0;
+
+// Variáveis de Orientação e Erros
+float yawSensor = 0.0, pitchSensor = 0.0;
+float offsetYaw = 0.0;
+float azimute = 0.0, inclinacao = 0.0;
+float erroAzimute = 0.0, erroInclinacao = 0.0;
+bool dadosRecebidosNRF = false;
+bool calibracaoFeita = false;
+
+// Mira
+const int deslocamentoMaximo = 50;
+const float maxErroAzimute = 45.0;
+const float maxErroInclinacao = 30.0;
+const float erroMiraPerfeito = 5.0;
+int16_t centroX = 240;
+int16_t centroY = 160;
+//Dados aceleração
+float alt_GPS,AccX,AccY, AccZ;
+
+// Simulação
+bool modoSimulacao = true;
+unsigned long tempoInicioSimulacao;
+uint32_t contadorPacoteSimulado = 0;
+
+void taskSimulador(void *pvParameters) {
+  tempoInicioSimulacao = millis();
+  float distanciaInicial = 400.0;
+  float direcaoAzimute = 90.0; // Lado direito
+  float deltaX = 1.0; // 1 metro por 100ms (10 m/s)
+  float deltaAlt = 1.0;
+
+  for (;;) {
+    if (!modoSimulacao) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    unsigned long tempoDecorrido = millis() - tempoInicioSimulacao;
+    float segundos = tempoDecorrido / 1000.0;
+
+    float deslocamentoX = deltaX * (tempoDecorrido / 100.0);
+    float deslocamentoAlt = (segundos < 20.0) ? (deltaAlt * (tempoDecorrido / 100.0)) : (deltaAlt * (200.0 - (tempoDecorrido / 100.0)));
+    if (deslocamentoAlt < 0) deslocamentoAlt = 0;
+
+    // Aproximação grosseira (1 deg lat ≈ 111320 m)
+    float dLat = 0;
+    float dLon = deslocamentoX / (111320.0 * cos(radians(lat_local)));
+    float distancia;
+    lat_cansat = lat_local + dLat;
+    lon_cansat = lon_local + dLon;
+    alt_cansat = alt_local + deslocamentoAlt;
+
+    dadosRecebidos.latitude = lat_cansat;
+    dadosRecebidos.longitude = lon_cansat;
+    dadosRecebidos.altitude = alt_cansat;
+    dadosRecebidos.NumeroPacote = ++contadorPacoteSimulado;
+
+    dadosRecebidosNRF = true;
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+// -- Funções de Cálculo --
+
+float calcularAzimute(float lat1, float lon1, float lat2, float lon2) {
+  float dLon = radians(lon2 - lon1);
+  lat1 = radians(lat1);
+  lat2 = radians(lat2);
+  float y = sin(dLon) * cos(lat2);
+  float x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon);
+  float brng = atan2(y, x);
+  brng = degrees(brng);
+  return fmod((brng + 360.0), 360.0);
+}
+
+float calcularDistanciaHorizontal(float lat1, float lon1, float lat2, float lon2) {
+  const float R = 6371000;
+  float dLat = radians(lat2 - lat1);
+  float dLon = radians(lon2 - lon1);
+  lat1 = radians(lat1);
+  lat2 = radians(lat2);
+  float a = sin(dLat/2) * sin(dLat/2) + cos(lat1) * cos(lat2) * sin(dLon/2) * sin(dLon/2);
+  float c = 2 * atan2(sqrt(a), sqrt(1-a));
+  return R * c;
+}
+
+float calcularInclinacao(float distanciaHorizontal, float alturaRelativa) {
+  return degrees(atan2(alturaRelativa, distanciaHorizontal));
+}
+
+float calcularErroAzimute(float yawCorrigido, float azimuteAlvo) {
+  float erro = azimuteAlvo - yawCorrigido;
+  if (erro > 180.0) erro -= 360.0;
+  if (erro < -180.0) erro += 360.0;
+  return erro;
+}
+
+float calcularErroInclinacao(float pitchAtual, float inclinacaoAlvo) {
+  return inclinacaoAlvo - pitchAtual;
+}
+
+// Correções de orientação
+float obterYawCorrigido() {
+  if (!calibracaoFeita) return yawSensor;
+  float yawCorrigido = yawSensor - offsetYaw;
+  if (yawCorrigido < 0) yawCorrigido += 360;
+  if (yawCorrigido >= 360) yawCorrigido -= 360;
+  return yawCorrigido;
+}
+
+// Atualização de Azimute e Inclinação
+void atualizarAzimuteInclinacao() {
+  if (!dadosRecebidosNRF) return;
+  distancia = calcularDistanciaHorizontal(lat_local, lon_local, lat_cansat, lon_cansat);
+  float alturaRelativa = alt_cansat - alt_local;
+  azimute = calcularAzimute(lat_local, lon_local, lat_cansat, lon_cansat);
+  inclinacao = calcularInclinacao(distancia, alturaRelativa);
+}
+
+// Atualizar Erros
+void atualizarErros() {
+  float yawCorrigido = obterYawCorrigido();
+  erroAzimute = calcularErroAzimute(yawCorrigido, azimute);
+  erroInclinacao = calcularErroInclinacao(pitchSensor, inclinacao);
+
+  Serial.print("[ERROS] Azimute: ");
+  Serial.print(erroAzimute, 2);
+  Serial.print("°  Inclinacao: ");
+  Serial.print(erroInclinacao, 2);
+  Serial.println("°");
+}
+
+// -- Sistema de Mira --
+
+int calcularDeslocamento(float erro, float maxErro) {
+  erro = constrain(erro, -maxErro, maxErro);
+  return (int)(erro / maxErro * deslocamentoMaximo);
+}
+
+bool miraAlinhada() {
+  return (abs(erroAzimute) < erroMiraPerfeito) && (abs(erroInclinacao) < erroMiraPerfeito);
+}
+
+void desenharSetasBusca() {
+  int setaTamanho = 10;
+  if (erroAzimute > erroMiraPerfeito) {
+    display.fillTriangle(centroX + 2*20, centroY, centroX + 20 + setaTamanho, centroY - setaTamanho, centroX + 20 + setaTamanho, centroY + setaTamanho, ST77XX_YELLOW);
+  } else if (erroAzimute < -erroMiraPerfeito) {
+    display.fillTriangle(centroX - 2*20, centroY, centroX - 20 - setaTamanho, centroY - setaTamanho, centroX - 20 - setaTamanho, centroY + setaTamanho, ST77XX_YELLOW);
+  }
+  if (erroInclinacao > erroMiraPerfeito) {
+    // Agora seta para BAIXO (devido à rotação 3 inverter Y)
+     display.fillTriangle(centroX, centroY - 2*20, centroX - setaTamanho, centroY - 20 - setaTamanho, centroX + setaTamanho, centroY - 20 - setaTamanho, ST77XX_YELLOW);
+  } else if (erroInclinacao < -erroMiraPerfeito) {
+    // Agora seta para CIMA
+       display.fillTriangle(centroX, centroY + 2*20, centroX - setaTamanho, centroY + 20 + setaTamanho, centroX + setaTamanho, centroY + 20 + setaTamanho, ST77XX_YELLOW);
+
+  }
+}
+
+void desenharMira() {
+  display.fillScreen(ST77XX_BLACK);
+  display.drawLine(centroX - 10, centroY, centroX + 10, centroY, ST77XX_WHITE);
+  display.drawLine(centroX, centroY - 10, centroX, centroY + 10, ST77XX_WHITE);
+  int deslocamentoX = calcularDeslocamento(erroAzimute, maxErroAzimute);
+  int deslocamentoY = calcularDeslocamento(erroInclinacao, maxErroInclinacao);
+  uint16_t corMira = miraAlinhada() ? ST77XX_GREEN : ST77XX_WHITE;
+  display.fillCircle(centroX, centroY, 5, corMira);
+  display.fillCircle(centroX + deslocamentoX, centroY - deslocamentoY, 5, ST77XX_RED); // Corrigido: + deslocamentoYdisplay.fillCircle(centroX + deslocamentoX, centroY - deslocamentoY, 5, ST77XX_RED);  if (!miraAlinhada()) desenharSetasBusca();
+  if (!miraAlinhada()) desenharSetasBusca();
+}
+
+// -- Tasks --
+
+void taskReadSensors(void *pvParameters) {
+  for (;;) {
+    bmp.performReading();
+    while (SerialGPS.available()) {
+      gps.encode(SerialGPS.read());
+    }
+    if (gps.location.isUpdated()) {
+      lat_local = gps.location.lat();
+      lon_local = gps.location.lng();
+      alt_local = bmp.readAltitude(1013.25); // usar altitude do barômetro
+
+      Serial.print("[LOCAL] Lat: ");
+      Serial.print(lat_local, 6);
+      Serial.print(" Lon: ");
+      Serial.print(lon_local, 6);
+      Serial.print(" Alt (BMP): ");
+      Serial.print(alt_local, 2);
+      Serial.println(" m");
+    }
+    imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
+    yawSensor = euler.x();
+    pitchSensor = euler.y();
+
+    Serial.print("Yaw: ");
+     Serial.println(yawSensor);
+     Serial.print("Pitch: ");
+     Serial.println(pitchSensor);
+    atualizarAzimuteInclinacao();
+    atualizarErros();
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void taskReceiveNRF(void *pvParameters) {
+  for (;;) {
+    network.update();
+    while (network.available()) {
+      RF24NetworkHeader header;
+      network.peek(header);
+      if (header.type == 'M') {
+        network.read(header, &dadosRecebidos, sizeof(dadosRecebidos));
+        dadosRecebidosNRF = true;
+        lat_cansat = dadosRecebidos.latitude;
+        lon_cansat = dadosRecebidos.longitude;
+        alt_cansat = dadosRecebidos.altitude; // usar altitude do barômetro
+       
+        Serial.println("[NRF] Dados Recebidos:");
+        Serial.print("  Pacote: "); Serial.println(dadosRecebidos.NumeroPacote);
+        Serial.print("  Lat: "); Serial.println(lat_cansat, 6);
+        Serial.print("  Lon: "); Serial.println(lon_cansat, 6);
+        Serial.print("  Alt (BMP): "); Serial.println(alt_cansat, 2);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+void taskUpdateDisplay(void *pvParameters) {
+  for (;;) {
+    desenharMira();
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+void calibrarYaw() {
+  offsetYaw = yawSensor;
+  calibracaoFeita = true;
+}
+
+void taskBotaoCalibrar(void *pvParameters) {
+  pinMode(PIN_BOTAO, INPUT_PULLUP);
+  bool botaoAnterior = HIGH;
+  for (;;) {
+    bool estadoBotao = digitalRead(PIN_BOTAO);
+    if (botaoAnterior == HIGH && estadoBotao == LOW) {
+      calibrarYaw();
+      tone(PIN_BUZZER, 2000, 100);
+    }
+    botaoAnterior = estadoBotao;
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+void escreverDadosLogger() {
+  if (!dadosRecebidosNRF) return;
+  SerialLogger.print(dadosRecebidos.NumeroPacote); SerialLogger.print(",");
+  SerialLogger.print(dadosRecebidos.timestamp); SerialLogger.print(",");
+  SerialLogger.print(dadosRecebidos.latitude, 6); SerialLogger.print(",");
+  SerialLogger.print(dadosRecebidos.longitude, 6); SerialLogger.print(",");
+  SerialLogger.print(dadosRecebidos.altitudeGPS);SerialLogger.print(",");
+  SerialLogger.print(azimute);SerialLogger.print(",");
+  SerialLogger.print(yawSensor);SerialLogger.print(",");
+  SerialLogger.print(erroAzimute);SerialLogger.print(",");
+  SerialLogger.print(inclinacao);SerialLogger.print(",");
+  SerialLogger.print(pitchSensor);SerialLogger.print(","); 
+  SerialLogger.print(erroInclinacao);SerialLogger.print(",");
+  SerialLogger.print(distancia);SerialLogger.print(",");
+    SerialLogger.print(dadosRecebidos.AccX);SerialLogger.print(",");
+    SerialLogger.print(dadosRecebidos.AccY);SerialLogger.print(",");
+    SerialLogger.print(dadosRecebidos.AccZ);SerialLogger.print(",");
+  SerialLogger.println();
+}
+
+void taskLogger(void *pvParameters) {
+  for (;;) {
+    escreverDadosLogger();
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+}
+
+// -- Setup e Loop --
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  bmp.begin_I2C();
+  bno.begin();
+  SerialGPS.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+  SerialLogger.begin(115200, SERIAL_8N1, PIN_DATALOGGER_RX, PIN_DATALOGGER_TX);
+  hspi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+  display.init(320, 480, 0, 0, ST7796S_RGB);
+  display.setRotation(3);
+  display.fillScreen(ST77XX_BLACK);
+  radio.begin();
+  network.begin(90, 01);
+  radio.setDataRate(RF24_2MBPS);
+
+  xTaskCreatePinnedToCore(taskReadSensors, "ReadSensors", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskReceiveNRF, "ReceiveNRF", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(taskUpdateDisplay, "UpdateDisplay", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskBotaoCalibrar, "BotaoCalibrar", 2048, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskLogger, "Logger", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskSimulador, "Simulador", 4096, NULL, 1, NULL, 1);
+}
+
+void loop() {
+  // vazio! Tudo feito por FreeRTOS
+}
