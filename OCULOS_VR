@@ -363,7 +363,7 @@ void setup() {
   display.fillScreen(ST77XX_BLACK);
   radio.begin();
   network.begin(90, 01);
-  radio.setDataRate(RF24_2MBPS);
+   radio.setAutoAck(false);
 
   xTaskCreatePinnedToCore(taskReadSensors, "ReadSensors", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(taskReceiveNRF, "ReceiveNRF", 4096, NULL, 1, NULL, 0);
